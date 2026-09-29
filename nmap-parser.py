@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import xml.etree.ElementTree as ET
 
 argparser = argparse.ArgumentParser(
@@ -29,43 +30,55 @@ ip_to_ports = {}
 all_ports = set()
 
 for filename in expanded:
+    # iterparse: streaming, avoids building a full DOM tree
+    ip = None
+    host_up = False
     try:
-        root = ET.parse(filename).getroot()
-    except ET.ParseError:
+        for event, elem in ET.iterparse(filename, events=("start", "end")):
+            tag = elem.tag
+            if event == "start":
+                if tag == "host":
+                    ip = None
+                    host_up = False
+                elif tag == "status" and elem.get("state") == "up":
+                    host_up = True
+                elif tag == "address" and elem.get("addrtype") == "ipv4":
+                    ip = elem.get("addr")
+            elif event == "end":
+                if tag == "port":
+                    if host_up and ip is not None:
+                        state_elem = elem.find("state")
+                        if state_elem is not None:
+                            state = state_elem.get("state", "")
+                            if state == "open" or (args.include_filtered and state == "filtered"):
+                                portid = elem.get("portid")
+                                if portid:
+                                    ip_to_ports.setdefault(ip, []).append(portid)
+                                    all_ports.add(portid)
+                    elem.clear()
+                elif tag == "host":
+                    elem.clear()
+    except (ET.ParseError, OSError):
         continue
-    if root.tag != "nmaprun":
-        continue
-    for host in root.findall(".//host"):
-        status = host.find("status")
-        if status is None or status.get("state") != "up":
-            continue
-        addr = host.find("address")
-        if addr is None:
-            continue
-        ip = addr.get("addr")
-
-        for port in host.findall(".//port"):
-            state_elem = port.find("state")
-            if state_elem is None:
-                continue
-            state = state_elem.get("state", "")
-            if state != "open" and not (args.include_filtered and state == "filtered"):
-                continue
-            portid = port.get("portid")
-            if portid:
-                ip_to_ports.setdefault(ip, []).append(portid)
-                all_ports.add(portid)
 
 for ip in ip_to_ports:
-    ip_to_ports[ip] = list(set(ip_to_ports[ip]))
+    ip_to_ports[ip] = sorted(set(ip_to_ports[ip]), key=int)
 
-for ip, ports in ip_to_ports.items():
-    if args.all_ports or args.output_mode:
-        ports = all_ports
-    if args.output_mode:
-        with open("uniq_ip.txt", "a", encoding="utf-8") as f:
-            f.write(f"{ip}\n")
-        with open("uniq_ports.txt", "w", encoding="utf-8") as f:
-            f.write(",".join(ports))
-    if not args.output_mode:
-        print(f"nmap {ip} -p {','.join(ports)} -oA nmap_{ip} {args.custom}")
+if args.output_mode:
+    with open("uniq_ip.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(ip_to_ports) + "\n")
+    with open("uniq_ports.txt", "w", encoding="utf-8") as f:
+        f.write(",".join(sorted(all_ports, key=int)) + "\n")
+else:
+    out = sys.stdout
+    try:
+        for ip, ports in ip_to_ports.items():
+            if args.all_ports:
+                ports = sorted(all_ports, key=int)
+            out.write(f"nmap {ip} -p {','.join(ports)} -oA nmap_{ip} {args.custom}\n")
+    except BrokenPipeError:
+        try:
+            out.close()
+        except BrokenPipeError:
+            pass
+        os._exit(0)
