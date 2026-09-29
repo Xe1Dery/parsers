@@ -34,13 +34,6 @@ OUTPUT_FILES = {
     "report1": "report1.txt",
 }
 
-RED = "\033[91m"
-YELLOW = "\033[93m"
-GREEN = "\033[92m"
-CYAN = "\033[96m"
-BOLD = "\033[1m"
-RESET = "\033[0m"
-
 # Well-known port → service name mapping (for hostports naming)
 KNOWN_SERVICES = {
     445: "smb", 161: "snmp", 25: "smtp", 21: "ftp", 2049: "nfs",
@@ -52,32 +45,14 @@ KNOWN_SERVICES = {
 # Hostports entries to suppress (noisy/useless)
 HOSTPORTS_SUPPRESS_SERVICES = {"msrpc", "unknown"}
 
+# Precompiled regexes (hot path — parsed per line)
+STATUS_RE = re.compile(r"Host:\s+([\d.]+)\s+\(.*?\)\s+Status:\s+(Up|Down)")
+PORTS_RE = re.compile(r"Host:\s+([\d.]+)\s+\(.*?\)\s+Ports:\s+(.*)")
+IGNORED_RE = re.compile(r"\s+Ignored\s+State:.*$")
+
 # --- Data model ---
 # Parsed port entry
 # (host, port, status, protocol, service, version)
-
-
-def banner():
-    print(f"{BOLD}  _  _ _    ___ _ _  _ ____ ___ ____    _  _ _  _ ____ ___")
-    print(f"  |  | |     |  | |\\/| |__|  |  |___    |\\ | |\\/| |__| |__]")
-    print("  |__| |___  |  | |  | |  |  |  |___    | \\| |  | |  | |    ")
-    print("           ___  ____ ____ ____ ____ ____")
-    print("           |__] |__| |__/ [__  |___ |__/")
-    print("           |    |  | |  \\ ___] |___ |  \\")
-    print()
-    print(f"{CYAN}Version: {VERSION}{RESET}")
-    print(f"{CYAN}Python rewrite of https://github.com/shifty0g/ultimate-nmap-parser{RESET}")
-    print()
-
-
-def footer():
-    print("─" * 86)
-    print("                       ___                           ")
-    print("              _  _  .-'   '-.                        ")
-    print("             (.)(.)/         \\                       ")
-    print("              /@@             ;                      ")
-    print("             o_\\-mm-......-mm\\`~~~~~~~~~~~~~~~~\\`   ")
-    print()
 
 
 def sort_ip(ip: str) -> tuple:
@@ -88,14 +63,14 @@ def sort_ip(ip: str) -> tuple:
         return (0, 0, 0, 0)
 
 
-def parse_gnmap_file(filepath: str) -> tuple[list[dict], dict[str, str]]:
+def parse_gnmap_file(filepath: str) -> tuple:
     """Parse a single .gnmap file.
 
     Returns (port_entries, host_status) where host_status maps IP->Up/Down.
     Each port_entries is a dict with host, status, port, port_status, protocol, service, version.
     """
-    host_status: dict[str, str] = {}
-    entries: list[dict] = []
+    host_status = {}
+    entries = []
 
     with open(filepath, errors="replace") as f:
         for line in f:
@@ -104,7 +79,7 @@ def parse_gnmap_file(filepath: str) -> tuple[list[dict], dict[str, str]]:
                 continue
 
             # Status line: Host: IP (...) Status: Up/Down
-            sm = re.match(r"Host:\s+([\d.]+)\s+\(.*?\)\s+Status:\s+(Up|Down)", line)
+            sm = STATUS_RE.match(line)
             if sm:
                 ip, st = sm.group(1), sm.group(2)
                 if ip not in host_status or st == "Up":
@@ -112,17 +87,15 @@ def parse_gnmap_file(filepath: str) -> tuple[list[dict], dict[str, str]]:
                 continue
 
             # Ports line: Host: IP (...) Ports: ...
-            pm = re.match(r"Host:\s+([\d.]+)\s+\(.*?\)\s+Ports:\s+(.*)", line)
+            pm = PORTS_RE.match(line)
             if not pm:
                 continue
             ip = pm.group(1)
-            ports_str = pm.group(2)
-            # Remove trailing "Ignored State: ..."
-            ports_str = re.sub(r"\s+Ignored\s+State:.*$", "", ports_str)
+            ports_str = IGNORED_RE.sub("", pm.group(2))
 
             hst = host_status.get(ip, "Up")
 
-            for entry in re.split(r",\s+", ports_str):
+            for entry in ports_str.split(","):
                 entry = entry.strip()
                 if not entry:
                     continue
@@ -147,8 +120,8 @@ def parse_gnmap_file(filepath: str) -> tuple[list[dict], dict[str, str]]:
 
 def collect_parsed(filepaths: list) -> tuple:
     """Parse all files, returning (sorted_entries, merged_host_status)."""
-    all_entries: list[dict] = []
-    merged_status: dict[str, str] = {}
+    all_entries = []
+    merged_status = {}
 
     for fp in filepaths:
         entries, hstatus = parse_gnmap_file(fp)
@@ -171,7 +144,7 @@ def get_closed_entries(all_entries: list) -> list:
 
 # --- Output generators ---
 
-def generate_csv(all_entries: list, outdir: str) -> Optional[str]:
+def generate_csv(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["csv"])
     # Include both open and closed (bash version includes both)
     entries = [e for e in all_entries if e["port_status"] in ("open", "closed")]
@@ -188,11 +161,10 @@ def generate_csv(all_entries: list, outdir: str) -> Optional[str]:
             seen.add(key)
             writer.writerow([e["host"], e["port"], e["port_status"], e["protocol"],
                              e["service"], e["version"]])
-    print(f"  - {OUTPUT_FILES['csv']}")
     return path
 
 
-def generate_summary(all_entries: list, outdir: str) -> Optional[str]:
+def generate_summary(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["summary"])
     open_entries = get_open_entries(all_entries)
     if not open_entries:
@@ -234,11 +206,10 @@ def generate_summary(all_entries: list, outdir: str) -> Optional[str]:
             f.write(f"| {e['host']:<{host_w}} | {pp:<{port_w + proto_w + 3}} | {sv:<{right_w}} |\n")
             last_host = e["host"]
         f.write(border + "\n")
-    print(f"  - {OUTPUT_FILES['summary']}")
     return path
 
 
-def generate_ipport(all_entries: list, outdir: str) -> Optional[str]:
+def generate_ipport(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["ipport"])
     open_entries = get_open_entries(all_entries)
     if not open_entries:
@@ -254,12 +225,11 @@ def generate_ipport(all_entries: list, outdir: str) -> Optional[str]:
     if lines:
         with open(path, "w") as f:
             f.write("\n".join(lines) + "\n")
-        print(f"  - {OUTPUT_FILES['ipport']}")
         return path
     return None
 
 
-def generate_uphosts(all_entries: list, host_status: dict, outdir: str) -> Optional[str]:
+def generate_uphosts(all_entries: list, host_status: dict, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["uphosts"])
     # Hosts that are "Up" OR have any open port
     up_hosts = set()
@@ -269,88 +239,76 @@ def generate_uphosts(all_entries: list, host_status: dict, outdir: str) -> Optio
         if st == "Up":
             up_hosts.add(host)
     if not up_hosts:
-        print(f"{RED}  - no up hosts{RESET}")
         return None
     with open(path, "w") as f:
         for ip in sorted(up_hosts, key=sort_ip):
             f.write(ip + "\n")
-    print(f"  - {OUTPUT_FILES['uphosts']}")
     return path
 
 
-def generate_downhosts(host_status: dict, outdir: str) -> Optional[str]:
+def generate_downhosts(host_status: dict, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["downhosts"])
     down = sorted([h for h, s in host_status.items() if s == "Down"], key=sort_ip)
     if not down:
-        print(f"{RED}  - no down hosts{RESET}")
         return None
     with open(path, "w") as f:
         for ip in down:
             f.write(ip + "\n")
-    print(f"  - {OUTPUT_FILES['downhosts']}")
     return path
 
 
-def generate_unique_ports(all_entries: list, outdir: str) -> Optional[str]:
+def generate_unique_ports(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["unique"])
     open_entries = get_open_entries(all_entries)
     ports = sorted(set(int(e["port"]) for e in open_entries if e["port"].isdigit()))
     if not ports:
-        print(f"{RED}  - no Unique ports{RESET}")
         return None
     with open(path, "w") as f:
         f.write(",".join(str(p) for p in ports) + "\n")
-    print(f"  - {OUTPUT_FILES['unique']}")
     return path
 
 
-def generate_tcp_ports(all_entries: list, outdir: str) -> Optional[str]:
+def generate_tcp_ports(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["tcp"])
     ports = sorted(set(
         int(e["port"]) for e in get_open_entries(all_entries)
         if e["protocol"] == "tcp" and e["port"].isdigit()
     ))
     if not ports:
-        print(f"{RED}  - no TCP ports{RESET}")
         return None
     with open(path, "w") as f:
         f.write(",".join(str(p) for p in ports) + "\n")
-    print(f"  - {OUTPUT_FILES['tcp']}")
     return path
 
 
-def generate_udp_ports(all_entries: list, outdir: str) -> Optional[str]:
+def generate_udp_ports(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["udp"])
     ports = sorted(set(
         int(e["port"]) for e in get_open_entries(all_entries)
         if e["protocol"] == "udp" and e["port"].isdigit()
     ))
     if not ports:
-        print(f"{RED}  - no UDP ports{RESET}")
         return None
     with open(path, "w") as f:
         f.write(",".join(str(p) for p in ports) + "\n")
-    print(f"  - {OUTPUT_FILES['udp']}")
     return path
 
 
-def generate_smb(all_entries: list, outdir: str) -> Optional[str]:
+def generate_smb(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["smb"])
     smb_hosts = sorted(set(
         e["host"] for e in get_open_entries(all_entries)
         if e["port"] == "445" and e["protocol"] == "tcp"
     ), key=sort_ip)
     if not smb_hosts:
-        print(f"{RED}  - no SMB ports{RESET}")
         return None
     with open(path, "w") as f:
         for ip in smb_hosts:
             f.write(f"smb://{ip}\n")
-    print(f"  - {OUTPUT_FILES['smb']}")
     return path
 
 
-def generate_web(all_entries: list, outdir: str) -> Optional[str]:
+def generate_web(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["web"])
     open_entries = get_open_entries(all_entries)
     urls = set()
@@ -375,17 +333,15 @@ def generate_web(all_entries: list, outdir: str) -> Optional[str]:
         if "web" in ver:
             urls.add(f"http://{e['host']}:{port}/")
     if not urls:
-        print(f"{RED}  - no web ports found{RESET}")
         return None
     with open(path, "w") as f:
         for url in sorted(urls, key=lambda u: (sort_ip(u.split("://")[1].split(":")[0]),
                                                   int(u.split(":")[-1].rstrip("/")))):
             f.write(url + "\n")
-    print(f"  - {OUTPUT_FILES['web']}")
     return path
 
 
-def generate_ssl(all_entries: list, outdir: str) -> Optional[str]:
+def generate_ssl(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["ssl"])
     open_entries = get_open_entries(all_entries)
     ssl_entries = set()
@@ -398,17 +354,15 @@ def generate_ssl(all_entries: list, outdir: str) -> Optional[str]:
         if "ssl" in svc or "ssl" in ver or "tls" in svc or "tls" in ver:
             ssl_entries.add(f"{e['host']}:{port}")
     if not ssl_entries:
-        print(f"{RED}  - no SSL/TLS ports found{RESET}")
         return None
     with open(path, "w") as f:
         for entry in sorted(ssl_entries, key=lambda x: (sort_ip(x.split(":")[0]),
                                                            int(x.split(":")[1]))):
             f.write(entry + "\n")
-    print(f"  - {OUTPUT_FILES['ssl']}")
     return path
 
 
-def generate_hostports(all_entries: list, outdir: str) -> Optional[str]:
+def generate_hostports(all_entries: list, outdir: str):
     hostsdir = os.path.join(outdir, HOSTSDIR)
     # Clean and recreate
     if os.path.exists(hostsdir):
@@ -447,20 +401,17 @@ def generate_hostports(all_entries: list, outdir: str) -> Optional[str]:
             for ip in sorted(set(hosts), key=sort_ip):
                 f.write(ip + "\n")
 
-    print(f"  - {HOSTSDIR}/[PROTOCOL]_[PORT]-[SERVICE].txt")
     return hostsdir
 
 
-def generate_closed_summary(all_entries: list, outdir: str) -> Optional[str]:
+def generate_closed_summary(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["closed"])
     closed_entries = get_closed_entries(all_entries)
     if not closed_entries:
-        print(f"{RED}  - no closed ports{RESET}")
         return None
 
     # Group by host
-    from collections import defaultdict as dd
-    host_ports: dict[str, set] = dd(set)
+    host_ports: dict[str, set] = defaultdict(set)
     for e in closed_entries:
         if e["port"].isdigit():
             host_ports[e["host"]].add(int(e["port"]))
@@ -474,11 +425,10 @@ def generate_closed_summary(all_entries: list, outdir: str) -> Optional[str]:
             ports_str = ", ".join(str(p) for p in ports)
             f.write(f"Closed Ports For Host: {host}\n")
             f.write(f"\t{ports_str}\n\n")
-    print(f"  - {OUTPUT_FILES['closed']}")
     return path
 
 
-def generate_report1(all_entries: list, outdir: str) -> Optional[str]:
+def generate_report1(all_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["report1"])
     open_entries = get_open_entries(all_entries)
     host_ports: dict[str, set] = defaultdict(set)
@@ -496,7 +446,6 @@ def generate_report1(all_entries: list, outdir: str) -> Optional[str]:
                 continue
             ports_str = ", ".join(str(p) for p in ports)
             f.write(f"{host} [{ports_str}]\n")
-    print(f"  - {OUTPUT_FILES['report1']}")
     return path
 
 
@@ -509,7 +458,7 @@ def main():
         epilog="""
 Examples:
   %(prog)s *.gnmap --all
-  %(prog)s tcp_scan.gnmap udp_scan.gnmap --summary --unique
+  %(prog)s scan.gnmap --csv --unique -o results/
   %(prog)s scan.gnmap --web --ssl
         """
     )
@@ -529,7 +478,8 @@ Examples:
     parser.add_argument("--ssl", action="store_true", help=f"SSL/TLS hosts ({OUTPUT_FILES['ssl']})")
     parser.add_argument("--hostports", action="store_true", help=f"Per-protocol host files ({HOSTSDIR}/)")
     parser.add_argument("--report1", action="store_true", help=f"IP[port1,port2] report ({OUTPUT_FILES['report1']})")
-    parser.add_argument("--outdir", default=None, help=f"Output directory (default: {OUTDIR} with --all, else .)")
+    parser.add_argument("-o", "--outdir", default=None,
+                        help=f"Output directory (default: {OUTDIR} with --all, else .)")
 
     args = parser.parse_args()
 
@@ -543,53 +493,52 @@ Examples:
                 args.up, args.down, args.ipport, args.smb, args.ssl,
                 args.web, args.hostports, args.closed, args.report1]):
         parser.print_help()
-        print(f"\n{RED}{BOLD}[X] No output format selected. Use --all or specific flags.{RESET}")
         sys.exit(1)
 
     outdir = args.outdir or (OUTDIR if args.all else os.getcwd())
     os.makedirs(outdir, exist_ok=True)
 
-    banner()
-
     # Collect all data in one pass
     all_entries, host_status = collect_parsed(args.files)
 
     if not all_entries:
-        print(f"{RED}[!] No data found in input files{RESET}")
+        print("[!] No data found in input files", file=sys.stderr)
         sys.exit(1)
 
     # Generate requested outputs
+    generated = []
     if args.csv:
-        generate_csv(all_entries, outdir)
+        p = generate_csv(all_entries, outdir); generated.append(p)
     if args.summary:
-        generate_summary(all_entries, outdir)
+        p = generate_summary(all_entries, outdir); generated.append(p)
     if args.ipport:
-        generate_ipport(all_entries, outdir)
+        p = generate_ipport(all_entries, outdir); generated.append(p)
     if args.unique:
-        generate_unique_ports(all_entries, outdir)
+        p = generate_unique_ports(all_entries, outdir); generated.append(p)
     if args.tcp:
-        generate_tcp_ports(all_entries, outdir)
+        p = generate_tcp_ports(all_entries, outdir); generated.append(p)
     if args.udp:
-        generate_udp_ports(all_entries, outdir)
+        p = generate_udp_ports(all_entries, outdir); generated.append(p)
     if args.up:
-        generate_uphosts(all_entries, host_status, outdir)
+        p = generate_uphosts(all_entries, host_status, outdir); generated.append(p)
     if args.down:
-        generate_downhosts(host_status, outdir)
+        p = generate_downhosts(host_status, outdir); generated.append(p)
     if args.smb:
-        generate_smb(all_entries, outdir)
+        p = generate_smb(all_entries, outdir); generated.append(p)
     if args.web:
-        generate_web(all_entries, outdir)
+        p = generate_web(all_entries, outdir); generated.append(p)
     if args.ssl:
-        generate_ssl(all_entries, outdir)
+        p = generate_ssl(all_entries, outdir); generated.append(p)
     if args.hostports:
-        generate_hostports(all_entries, outdir)
+        p = generate_hostports(all_entries, outdir); generated.append(p)
     if args.closed:
-        generate_closed_summary(all_entries, outdir)
+        p = generate_closed_summary(all_entries, outdir); generated.append(p)
     if args.report1:
-        generate_report1(all_entries, outdir)
+        p = generate_report1(all_entries, outdir); generated.append(p)
 
-    footer()
-    print(f"\n{GREEN}[+] Done. Output in: {os.path.abspath(outdir)}/{RESET}")
+    # Single line of output: where things were saved
+    count = len([p for p in generated if p])
+    print(f"[+] {count} file(s) written to: {os.path.abspath(outdir)}")
 
 
 if __name__ == "__main__":

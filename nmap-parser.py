@@ -1,7 +1,9 @@
 import argparse
+import multiprocessing
 import os
 import sys
 import xml.etree.ElementTree as ET
+from concurrent.futures import ProcessPoolExecutor
 
 argparser = argparse.ArgumentParser(
     description="Парсинг nmap XML в bash-скрипт nmap. Вывод: nmap {IP} -p {ports} <ФЛАГИ> -oA nmap_{IP}",
@@ -13,24 +15,26 @@ argparser.add_argument('-c', '--custom', type=str,
 argparser.add_argument('-a', '--all_ports', action='store_true', help="Добавить все уникальные порты ко всем командам")
 argparser.add_argument('-om', '--output_mode', action='store_true', help="Вывести список IP и уникальных портов в файлы")
 argparser.add_argument('--include-filtered', action='store_true', help="Включить filtered порты")
+argparser.add_argument('-w', '--workers', type=int, default=0,
+    help="Кол-во процессов для параллельного разбора (0 = все ядра)")
 
 args = argparser.parse_args()
 
-# Expand directories to XML files
+# Expand directories to XML files (scandir is faster than listdir+isdir)
 expanded = []
 for path in args.filenames:
     if os.path.isdir(path):
-        for entry in sorted(os.listdir(path)):
-            if entry.endswith(".xml"):
-                expanded.append(os.path.join(path, entry))
+        with os.scandir(path) as it:
+            for entry in it:
+                if entry.name.endswith(".xml") and entry.is_file(follow_symlinks=False):
+                    expanded.append(entry.path)
     else:
         expanded.append(path)
 
-ip_to_ports = {}
-all_ports = set()
 
-for filename in expanded:
-    # iterparse: streaming, avoids building a full DOM tree
+def parse_file(filename):
+    """Stream-parse one nmap XML. Returns list of (ip, portid) tuples."""
+    results = []
     ip = None
     host_up = False
     try:
@@ -50,35 +54,62 @@ for filename in expanded:
                         state_elem = elem.find("state")
                         if state_elem is not None:
                             state = state_elem.get("state", "")
-                            if state == "open" or (args.include_filtered and state == "filtered"):
+                            if state == "open" or state == "filtered":
                                 portid = elem.get("portid")
                                 if portid:
-                                    ip_to_ports.setdefault(ip, []).append(portid)
-                                    all_ports.add(portid)
+                                    results.append((ip, portid, state))
                     elem.clear()
                 elif tag == "host":
                     elem.clear()
     except (ET.ParseError, OSError):
-        continue
+        pass
+    return results
 
-for ip in ip_to_ports:
-    ip_to_ports[ip] = sorted(set(ip_to_ports[ip]), key=int)
 
-if args.output_mode:
-    with open("uniq_ip.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(ip_to_ports) + "\n")
-    with open("uniq_ports.txt", "w", encoding="utf-8") as f:
-        f.write(",".join(sorted(all_ports, key=int)) + "\n")
-else:
-    out = sys.stdout
-    try:
-        for ip, ports in ip_to_ports.items():
-            if args.all_ports:
-                ports = sorted(all_ports, key=int)
-            out.write(f"nmap {ip} -p {','.join(ports)} -oA nmap_{ip} {args.custom}\n")
-    except BrokenPipeError:
+def main():
+    # Parallel parse across processes
+    workers = args.workers or os.cpu_count() or 1
+    ip_to_ports = {}
+    all_ports = set()
+
+    if workers > 1 and len(expanded) > 1:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            chunks = ex.map(parse_file, expanded, chunksize=256)
+        for results in chunks:
+            for ip, portid, state in results:
+                if state == "open" or (args.include_filtered and state == "filtered"):
+                    ip_to_ports.setdefault(ip, []).append(portid)
+                    all_ports.add(portid)
+    else:
+        for filename in expanded:
+            for ip, portid, state in parse_file(filename):
+                if state == "open" or (args.include_filtered and state == "filtered"):
+                    ip_to_ports.setdefault(ip, []).append(portid)
+                    all_ports.add(portid)
+
+    for ip in ip_to_ports:
+        ip_to_ports[ip] = sorted(set(ip_to_ports[ip]), key=int)
+
+    if args.output_mode:
+        with open("uniq_ip.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(ip_to_ports) + "\n")
+        with open("uniq_ports.txt", "w", encoding="utf-8") as f:
+            f.write(",".join(sorted(all_ports, key=int)) + "\n")
+    else:
+        out = sys.stdout
         try:
-            out.close()
+            for ip, ports in ip_to_ports.items():
+                if args.all_ports:
+                    ports = sorted(all_ports, key=int)
+                out.write(f"nmap {ip} -p {','.join(ports)} -oA nmap_{ip} {args.custom}\n")
         except BrokenPipeError:
-            pass
-        os._exit(0)
+            try:
+                out.close()
+            except BrokenPipeError:
+                pass
+            os._exit(0)
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    main()
