@@ -17,6 +17,7 @@ from collections import defaultdict
 VERSION = "1.0"
 OUTDIR = "parse"
 HOSTSDIR = "hosts"
+PORTGROUPSDIR = "port-groups"
 
 OUTPUT_FILES = {
     "csv": "parsed_nmap.csv",
@@ -449,6 +450,42 @@ def generate_report1(all_entries: list, outdir: str):
     return path
 
 
+def generate_portgroups(all_entries: list, outdir: str):
+    """Write one file per group of hosts sharing an identical open-port set.
+
+    Each file is named after its port set (e.g. 22tcp-80tcp.txt) and contains
+    the IPs of the hosts in that group, one per line.
+    """
+    groupsdir = os.path.join(outdir, PORTGROUPSDIR)
+    if os.path.exists(groupsdir):
+        import shutil
+        shutil.rmtree(groupsdir)
+    os.makedirs(groupsdir)
+
+    open_entries = get_open_entries(all_entries)
+    host_ports: dict[str, set] = defaultdict(set)
+    for e in open_entries:
+        if e["port"].isdigit():
+            host_ports[e["host"]].add((int(e["port"]), e["protocol"]))
+
+    if not host_ports:
+        return None
+
+    groups: dict[tuple, list[str]] = defaultdict(list)
+    for host, ports in host_ports.items():
+        groups[tuple(sorted(ports))].append(host)
+
+    written = 0
+    for ports, hosts in sorted(groups.items()):
+        fname = "-".join(f"{p}{proto}" for p, proto in ports) + ".txt"
+        with open(os.path.join(groupsdir, fname), "w") as f:
+            for ip in sorted(set(hosts), key=sort_ip):
+                f.write(ip + "\n")
+        written += 1
+
+    return groupsdir if written else None
+
+
 # --- CLI ---
 
 def main():
@@ -478,6 +515,8 @@ Examples:
     parser.add_argument("--ssl", action="store_true", help=f"SSL/TLS hosts ({OUTPUT_FILES['ssl']})")
     parser.add_argument("--hostports", action="store_true", help=f"Per-protocol host files ({HOSTSDIR}/)")
     parser.add_argument("--report1", action="store_true", help=f"IP[port1,port2] report ({OUTPUT_FILES['report1']})")
+    parser.add_argument("--portgroups", action="store_true",
+                        help=f"One file per group of hosts with identical open ports ({PORTGROUPSDIR}/)")
     parser.add_argument("-o", "--outdir", default=None,
                         help=f"Output directory (default: {OUTDIR} with --all, else .)")
 
@@ -486,12 +525,13 @@ Examples:
     if args.all:
         args.csv = args.summary = args.unique = args.tcp = args.udp = True
         args.up = args.down = args.ipport = args.smb = args.ssl = args.web = True
-        args.hostports = args.closed = True
+        args.hostports = args.closed = args.portgroups = True
         args.report1 = False
 
     if not any([args.csv, args.summary, args.unique, args.tcp, args.udp,
                 args.up, args.down, args.ipport, args.smb, args.ssl,
-                args.web, args.hostports, args.closed, args.report1]):
+                args.web, args.hostports, args.closed, args.report1,
+                args.portgroups]):
         parser.print_help()
         sys.exit(1)
 
@@ -535,6 +575,8 @@ Examples:
         p = generate_closed_summary(all_entries, outdir); generated.append(p)
     if args.report1:
         p = generate_report1(all_entries, outdir); generated.append(p)
+    if args.portgroups:
+        p = generate_portgroups(all_entries, outdir); generated.append(p)
 
     # Single line of output: where things were saved
     count = len([p for p in generated if p])
