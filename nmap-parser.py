@@ -29,7 +29,12 @@ ip_to_ports = {}
 all_ports = set()
 
 for filename in expanded:
-    root = ET.parse(filename).getroot()
+    try:
+        root = ET.parse(filename).getroot()
+    except ET.ParseError:
+        continue
+    if root.tag != "nmaprun":
+        continue
     for host in root.findall(".//host"):
         status = host.find("status")
         if status is None or status.get("state") != "up":
