@@ -17,7 +17,6 @@ from collections import defaultdict
 VERSION = "1.0"
 OUTDIR = "parse"
 HOSTSDIR = "hosts"
-PORTGROUPSDIR = "port-groups"
 
 OUTPUT_FILES = {
     "csv": "parsed_nmap.csv",
@@ -33,6 +32,7 @@ OUTPUT_FILES = {
     "web": "web-urls.txt",
     "ssl": "ssl.txt",
     "report1": "report1.txt",
+    "portgroups": "port-groups.csv",
 }
 
 # Well-known port → service name mapping (for hostports naming)
@@ -451,17 +451,12 @@ def generate_report1(all_entries: list, outdir: str):
 
 
 def generate_portgroups(all_entries: list, outdir: str):
-    """Write one file per group of hosts sharing an identical open-port set.
+    """Write hosts grouped by identical open-port set, one row per group.
 
-    Each file is named after its port set (e.g. 22tcp-80tcp.txt) and contains
-    the IPs of the hosts in that group, one per line.
+    CSV columns: ports (port/proto pairs joined by ";"), count, hosts
+    (IPs joined by ";"). Groups are sorted by their port set.
     """
-    groupsdir = os.path.join(outdir, PORTGROUPSDIR)
-    if os.path.exists(groupsdir):
-        import shutil
-        shutil.rmtree(groupsdir)
-    os.makedirs(groupsdir)
-
+    path = os.path.join(outdir, OUTPUT_FILES["portgroups"])
     open_entries = get_open_entries(all_entries)
     host_ports: dict[str, set] = defaultdict(set)
     for e in open_entries:
@@ -475,15 +470,14 @@ def generate_portgroups(all_entries: list, outdir: str):
     for host, ports in host_ports.items():
         groups[tuple(sorted(ports))].append(host)
 
-    written = 0
-    for ports, hosts in sorted(groups.items()):
-        fname = "-".join(f"{p}{proto}" for p, proto in ports) + ".txt"
-        with open(os.path.join(groupsdir, fname), "w") as f:
-            for ip in sorted(set(hosts), key=sort_ip):
-                f.write(ip + "\n")
-        written += 1
-
-    return groupsdir if written else None
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ports", "count", "hosts"])
+        for ports, hosts in sorted(groups.items()):
+            hosts = sorted(set(hosts), key=sort_ip)
+            ports_str = ";".join(f"{p}/{proto}" for p, proto in ports)
+            writer.writerow([ports_str, len(hosts), ";".join(hosts)])
+    return path
 
 
 # --- CLI ---
@@ -516,7 +510,7 @@ Examples:
     parser.add_argument("--hostports", action="store_true", help=f"Per-protocol host files ({HOSTSDIR}/)")
     parser.add_argument("--report1", action="store_true", help=f"IP[port1,port2] report ({OUTPUT_FILES['report1']})")
     parser.add_argument("--portgroups", action="store_true",
-                        help=f"One file per group of hosts with identical open ports ({PORTGROUPSDIR}/)")
+                        help=f"Hosts grouped by identical open ports, one row per group ({OUTPUT_FILES['portgroups']})")
     parser.add_argument("-o", "--outdir", default=None,
                         help=f"Output directory (default: {OUTDIR} with --all, else .)")
 
