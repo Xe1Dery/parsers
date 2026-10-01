@@ -8,10 +8,12 @@ Usage: python ultimate-nmap-parser.py [--all|--csv|--summary|...] file1.gnmap [f
 
 import argparse
 import csv
+import multiprocessing
 import os
 import re
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 
 # --- Constants ---
 VERSION = "1.0"
@@ -56,12 +58,24 @@ IGNORED_RE = re.compile(r"\s+Ignored\s+State:.*$")
 # (host, port, status, protocol, service, version)
 
 
+_IP_SORT_CACHE: dict = {}
+
+
 def sort_ip(ip: str) -> tuple:
-    """Sort key for IP addresses — numeric octet order."""
+    """Sort key for IP addresses — numeric octet order.
+
+    Memoized: at scale this key is requested millions of times, so caching the
+    parsed octets turns repeated string splitting into a dict lookup.
+    """
+    cached = _IP_SORT_CACHE.get(ip)
+    if cached is not None:
+        return cached
     try:
-        return tuple(int(o) for o in ip.split("."))
+        key = tuple(int(o) for o in ip.split("."))
     except (ValueError, AttributeError):
-        return (0, 0, 0, 0)
+        key = (0, 0, 0, 0)
+    _IP_SORT_CACHE[ip] = key
+    return key
 
 
 def parse_gnmap_file(filepath: str) -> tuple:
@@ -119,20 +133,72 @@ def parse_gnmap_file(filepath: str) -> tuple:
     return entries, host_status
 
 
-def collect_parsed(filepaths: list) -> tuple:
-    """Parse all files, returning (sorted_entries, merged_host_status)."""
-    all_entries = []
-    merged_status = {}
+# Entry field order used for the compact tuple form that crosses IPC.
+ENTRY_FIELDS = ("host", "status", "port", "port_status", "protocol", "service", "version")
 
-    for fp in filepaths:
-        entries, hstatus = parse_gnmap_file(fp)
-        all_entries.extend(entries)
+
+def _entry_key(t: tuple) -> tuple:
+    """Dedup key for a compact entry tuple: (host, port, protocol, port_status)."""
+    return (t[0], t[2], t[4], t[3])
+
+
+def _parse_worker(filepath: str) -> tuple:
+    """ProcessPool worker: parse one file, dedup it, return compact tuples.
+
+    Returning tuples instead of dicts keeps the pickled payload small, which
+    matters when a scan set contains millions of port entries.
+    """
+    entries, hstatus = parse_gnmap_file(filepath)
+    seen = set()
+    out = []
+    for e in entries:
+        t = (e["host"], e["status"], e["port"], e["port_status"],
+             e["protocol"], e["service"], e["version"])
+        k = _entry_key(t)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out, hstatus
+
+
+def collect_parsed(filepaths: list, workers: int = 0) -> tuple:
+    """Parse all files, returning (sorted_entries, merged_host_status).
+
+    Deduplicates on (host, port, protocol, port_status) — every report already
+    drops these duplicates internally, so this shrinks the working set without
+    changing any output. Files are parsed in a process pool when workers > 1.
+    """
+    merged_status: dict = {}
+    unique: list = []
+    seen: set = set()
+
+    def merge(entries, hstatus):
+        for t in entries:
+            k = _entry_key(t)
+            if k in seen:
+                continue
+            seen.add(k)
+            unique.append(dict(zip(ENTRY_FIELDS, t)))
         for ip, st in hstatus.items():
             if ip not in merged_status or st == "Up":
                 merged_status[ip] = st
 
-    all_entries.sort(key=lambda e: sort_ip(e["host"]))
-    return all_entries, merged_status
+    n = len(filepaths)
+    if workers <= 0:
+        workers = os.cpu_count() or 1
+
+    if workers > 1 and n >= 64:
+        chunksize = max(1, min(256, n // (workers * 4)))
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for entries, hstatus in ex.map(_parse_worker, filepaths, chunksize=chunksize):
+                merge(entries, hstatus)
+    else:
+        for fp in filepaths:
+            merge(*_parse_worker(fp))
+
+    unique.sort(key=lambda e: sort_ip(e["host"]))
+    return unique, merged_status
 
 
 def get_open_entries(all_entries: list) -> list:
@@ -165,9 +231,8 @@ def generate_csv(all_entries: list, outdir: str):
     return path
 
 
-def generate_summary(all_entries: list, outdir: str):
+def generate_summary(open_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["summary"])
-    open_entries = get_open_entries(all_entries)
     if not open_entries:
         return None
 
@@ -210,9 +275,8 @@ def generate_summary(all_entries: list, outdir: str):
     return path
 
 
-def generate_ipport(all_entries: list, outdir: str):
+def generate_ipport(open_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["ipport"])
-    open_entries = get_open_entries(all_entries)
     if not open_entries:
         return None
     seen = set()
@@ -230,11 +294,11 @@ def generate_ipport(all_entries: list, outdir: str):
     return None
 
 
-def generate_uphosts(all_entries: list, host_status: dict, outdir: str):
+def generate_uphosts(open_entries: list, host_status: dict, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["uphosts"])
     # Hosts that are "Up" OR have any open port
     up_hosts = set()
-    for e in get_open_entries(all_entries):
+    for e in open_entries:
         up_hosts.add(e["host"])
     for host, st in host_status.items():
         if st == "Up":
@@ -258,9 +322,8 @@ def generate_downhosts(host_status: dict, outdir: str):
     return path
 
 
-def generate_unique_ports(all_entries: list, outdir: str):
+def generate_unique_ports(open_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["unique"])
-    open_entries = get_open_entries(all_entries)
     ports = sorted(set(int(e["port"]) for e in open_entries if e["port"].isdigit()))
     if not ports:
         return None
@@ -269,10 +332,10 @@ def generate_unique_ports(all_entries: list, outdir: str):
     return path
 
 
-def generate_tcp_ports(all_entries: list, outdir: str):
+def generate_tcp_ports(open_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["tcp"])
     ports = sorted(set(
-        int(e["port"]) for e in get_open_entries(all_entries)
+        int(e["port"]) for e in open_entries
         if e["protocol"] == "tcp" and e["port"].isdigit()
     ))
     if not ports:
@@ -282,10 +345,10 @@ def generate_tcp_ports(all_entries: list, outdir: str):
     return path
 
 
-def generate_udp_ports(all_entries: list, outdir: str):
+def generate_udp_ports(open_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["udp"])
     ports = sorted(set(
-        int(e["port"]) for e in get_open_entries(all_entries)
+        int(e["port"]) for e in open_entries
         if e["protocol"] == "udp" and e["port"].isdigit()
     ))
     if not ports:
@@ -295,10 +358,10 @@ def generate_udp_ports(all_entries: list, outdir: str):
     return path
 
 
-def generate_smb(all_entries: list, outdir: str):
+def generate_smb(open_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["smb"])
     smb_hosts = sorted(set(
-        e["host"] for e in get_open_entries(all_entries)
+        e["host"] for e in open_entries
         if e["port"] == "445" and e["protocol"] == "tcp"
     ), key=sort_ip)
     if not smb_hosts:
@@ -309,9 +372,8 @@ def generate_smb(all_entries: list, outdir: str):
     return path
 
 
-def generate_web(all_entries: list, outdir: str):
+def generate_web(open_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["web"])
-    open_entries = get_open_entries(all_entries)
     urls = set()
     for e in open_entries:
         port = e["port"]
@@ -342,9 +404,8 @@ def generate_web(all_entries: list, outdir: str):
     return path
 
 
-def generate_ssl(all_entries: list, outdir: str):
+def generate_ssl(open_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["ssl"])
-    open_entries = get_open_entries(all_entries)
     ssl_entries = set()
     for e in open_entries:
         port = e["port"]
@@ -363,7 +424,7 @@ def generate_ssl(all_entries: list, outdir: str):
     return path
 
 
-def generate_hostports(all_entries: list, outdir: str):
+def generate_hostports(open_entries: list, outdir: str):
     hostsdir = os.path.join(outdir, HOSTSDIR)
     # Clean and recreate
     if os.path.exists(hostsdir):
@@ -371,7 +432,6 @@ def generate_hostports(all_entries: list, outdir: str):
         shutil.rmtree(hostsdir)
     os.makedirs(hostsdir)
 
-    open_entries = get_open_entries(all_entries)
     # Group by (protocol, port, service)
     groups: dict[tuple, list[str]] = defaultdict(list)
     for e in open_entries:
@@ -405,9 +465,8 @@ def generate_hostports(all_entries: list, outdir: str):
     return hostsdir
 
 
-def generate_closed_summary(all_entries: list, outdir: str):
+def generate_closed_summary(closed_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["closed"])
-    closed_entries = get_closed_entries(all_entries)
     if not closed_entries:
         return None
 
@@ -429,9 +488,8 @@ def generate_closed_summary(all_entries: list, outdir: str):
     return path
 
 
-def generate_report1(all_entries: list, outdir: str):
+def generate_report1(open_entries: list, outdir: str):
     path = os.path.join(outdir, OUTPUT_FILES["report1"])
-    open_entries = get_open_entries(all_entries)
     host_ports: dict[str, set] = defaultdict(set)
     for e in open_entries:
         if e["port"].isdigit():
@@ -450,14 +508,13 @@ def generate_report1(all_entries: list, outdir: str):
     return path
 
 
-def generate_portgroups(all_entries: list, outdir: str):
+def generate_portgroups(open_entries: list, outdir: str):
     """Write hosts grouped by identical open-port set, one row per group.
 
     CSV columns: ports (port/proto pairs joined by ";"), count, hosts
     (IPs joined by ";"). Groups are sorted by their port set.
     """
     path = os.path.join(outdir, OUTPUT_FILES["portgroups"])
-    open_entries = get_open_entries(all_entries)
     host_ports: dict[str, set] = defaultdict(set)
     for e in open_entries:
         if e["port"].isdigit():
@@ -493,7 +550,7 @@ Examples:
   %(prog)s scan.gnmap --web --ssl
         """
     )
-    parser.add_argument("files", nargs="+", help="One or more .gnmap files")
+    parser.add_argument("files", nargs="+", help="One or more .gnmap files or directories to scan")
     parser.add_argument("--all", action="store_true", help="Generate ALL reports (except --report1)")
     parser.add_argument("--csv", action="store_true", help=f"Create CSV file ({OUTPUT_FILES['csv']})")
     parser.add_argument("--summary", action="store_true", help=f"Host summary report ({OUTPUT_FILES['summary']})")
@@ -513,6 +570,8 @@ Examples:
                         help=f"Hosts grouped by identical open ports, one row per group ({OUTPUT_FILES['portgroups']})")
     parser.add_argument("-o", "--outdir", default=None,
                         help=f"Output directory (default: {OUTDIR} with --all, else .)")
+    parser.add_argument("-w", "--workers", type=int, default=0,
+                        help="Processes for parallel parsing (0 = all cores, 1 = single)")
 
     args = parser.parse_args()
 
@@ -532,45 +591,60 @@ Examples:
     outdir = args.outdir or (OUTDIR if args.all else os.getcwd())
     os.makedirs(outdir, exist_ok=True)
 
+    # Expand directories to .gnmap files (scandir avoids shell glob/ARG_MAX limits)
+    inputs = []
+    for path in args.files:
+        if os.path.isdir(path):
+            with os.scandir(path) as it:
+                for entry in it:
+                    if entry.name.endswith(".gnmap") and entry.is_file(follow_symlinks=False):
+                        inputs.append(entry.path)
+        else:
+            inputs.append(path)
+
     # Collect all data in one pass
-    all_entries, host_status = collect_parsed(args.files)
+    all_entries, host_status = collect_parsed(inputs, args.workers)
 
     if not all_entries:
         print("[!] No data found in input files", file=sys.stderr)
         sys.exit(1)
+
+    # Slice the working set once instead of rescanning it in every generator
+    open_entries = get_open_entries(all_entries)
+    closed_entries = get_closed_entries(all_entries)
 
     # Generate requested outputs
     generated = []
     if args.csv:
         p = generate_csv(all_entries, outdir); generated.append(p)
     if args.summary:
-        p = generate_summary(all_entries, outdir); generated.append(p)
+        p = generate_summary(open_entries, outdir); generated.append(p)
     if args.ipport:
-        p = generate_ipport(all_entries, outdir); generated.append(p)
+        p = generate_ipport(open_entries, outdir); generated.append(p)
     if args.unique:
-        p = generate_unique_ports(all_entries, outdir); generated.append(p)
+        p = generate_unique_ports(open_entries, outdir); generated.append(p)
     if args.tcp:
-        p = generate_tcp_ports(all_entries, outdir); generated.append(p)
+        p = generate_tcp_ports(open_entries, outdir); generated.append(p)
     if args.udp:
-        p = generate_udp_ports(all_entries, outdir); generated.append(p)
+        p = generate_udp_ports(open_entries, outdir); generated.append(p)
     if args.up:
-        p = generate_uphosts(all_entries, host_status, outdir); generated.append(p)
+        p = generate_uphosts(open_entries, host_status, outdir); generated.append(p)
     if args.down:
         p = generate_downhosts(host_status, outdir); generated.append(p)
     if args.smb:
-        p = generate_smb(all_entries, outdir); generated.append(p)
+        p = generate_smb(open_entries, outdir); generated.append(p)
     if args.web:
-        p = generate_web(all_entries, outdir); generated.append(p)
+        p = generate_web(open_entries, outdir); generated.append(p)
     if args.ssl:
-        p = generate_ssl(all_entries, outdir); generated.append(p)
+        p = generate_ssl(open_entries, outdir); generated.append(p)
     if args.hostports:
-        p = generate_hostports(all_entries, outdir); generated.append(p)
+        p = generate_hostports(open_entries, outdir); generated.append(p)
     if args.closed:
-        p = generate_closed_summary(all_entries, outdir); generated.append(p)
+        p = generate_closed_summary(closed_entries, outdir); generated.append(p)
     if args.report1:
-        p = generate_report1(all_entries, outdir); generated.append(p)
+        p = generate_report1(open_entries, outdir); generated.append(p)
     if args.portgroups:
-        p = generate_portgroups(all_entries, outdir); generated.append(p)
+        p = generate_portgroups(open_entries, outdir); generated.append(p)
 
     # Single line of output: where things were saved
     count = len([p for p in generated if p])
@@ -578,4 +652,5 @@ Examples:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
